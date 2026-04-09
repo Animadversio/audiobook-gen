@@ -51,12 +51,12 @@ STATUS_EMOJI = {
 }
 
 STATUS_COLOR = {
-    "done": "#d4edda",
-    "uploading": "#cce5ff",
-    "generating": "#fff3cd",
-    "pending": "#f8f9fa",
-    "skipped": "#e2e3e5",
-    "error": "#f8d7da",
+    "done": "#0d1f17",
+    "uploading": "#0d1b2e",
+    "generating": "#1f1b0d",
+    "pending": "#0d1117",
+    "skipped": "#161b22",
+    "error": "#2a0f0f",
 }
 
 
@@ -220,24 +220,24 @@ def render_html(plan: dict, audio_dir: Path | None = None) -> str:
   <meta http-equiv="refresh" content="30">
   <title>《{book_title}》有声书进度</title>
   <style>
-    body {{ font-family: -apple-system, sans-serif; max-width: 1200px; margin: 2em auto; padding: 0 1em; }}
-    h1 {{ color: #333; }}
-    .meta {{ color: #666; margin-bottom: 1.5em; }}
+    body {{ font-family: -apple-system, sans-serif; max-width: 1200px; margin: 2em auto; padding: 0 1em; background: #0d1117; color: #e6edf3; }}
+    h1 {{ color: #e6edf3; }}
+    .meta {{ color: #8b949e; margin-bottom: 1.5em; }}
     .progress-wrap {{ margin: 0.5em 0 1.5em; }}
-    .progress-label {{ font-size: 0.85em; color: #555; margin-bottom: 3px; }}
-    .progress-bar {{ background: #eee; border-radius: 8px; height: 16px; }}
-    .progress-fill-green {{ background: #28a745; height: 100%; border-radius: 8px; transition: width 0.5s; }}
+    .progress-label {{ font-size: 0.85em; color: #8b949e; margin-bottom: 3px; }}
+    .progress-bar {{ background: #21262d; border-radius: 8px; height: 16px; }}
+    .progress-fill-green {{ background: #238636; height: 100%; border-radius: 8px; transition: width 0.5s; }}
     .stats {{ display: flex; gap: 2em; margin: 1em 0 1.5em; flex-wrap: wrap; }}
     .stat {{ text-align: center; }}
-    .stat-num {{ font-size: 2em; font-weight: bold; color: #28a745; }}
-    .stat-label {{ color: #666; font-size: 0.9em; }}
-    .eta-box {{ display:inline-block; background:#fff3cd; border:1px solid #ffc107; border-radius:6px; padding:4px 12px; font-weight:bold; color:#856404; margin-left:1em; }}
+    .stat-num {{ font-size: 2em; font-weight: bold; color: #3fb950; }}
+    .stat-label {{ color: #8b949e; font-size: 0.9em; }}
+    .eta-box {{ display:inline-block; background:#272115; border:1px solid #9e6a03; border-radius:6px; padding:4px 12px; font-weight:bold; color:#d29922; margin-left:1em; }}
     table {{ border-collapse: collapse; width: 100%; margin-top: 1em; }}
-    th {{ background: #343a40; color: white; padding: 8px 12px; text-align: left; }}
-    td {{ padding: 8px 12px; border-bottom: 1px solid #dee2e6; vertical-align:middle; }}
-    .badge {{ background: #ffc107; color: #000; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; }}
-    a {{ color: #007bff; text-decoration: none; }}
-    .refresh {{ color: #999; font-size: 0.8em; text-align: right; margin-top: 1em; }}
+    th {{ background: #161b22; color: #8b949e; padding: 8px 12px; text-align: left; border-bottom: 1px solid #30363d; }}
+    td {{ padding: 8px 12px; border-bottom: 1px solid #21262d; vertical-align:middle; }}
+    .badge {{ background: #9e6a03; color: #e6edf3; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; }}
+    a {{ color: #58a6ff; text-decoration: none; }}
+    .refresh {{ color: #484f58; font-size: 0.8em; text-align: right; margin-top: 1em; }}
   </style>
 </head>
 <body>
