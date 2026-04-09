@@ -257,6 +257,75 @@ PYTHONIOENCODING=utf-8 python audiobook_gen.py generate ...
 
 **Fix:** Use `VoxCPM.from_pretrained("openbmb/VoxCPM2", load_denoiser=False)` with no device call.
 
+---
+
+### torch inductor: Failed to find C compiler
+
+**Symptom:** Every segment fails immediately with:
+```
+backend='inductor' raised:
+RuntimeError: Failed to find C compiler. Please specify via CC environment variable.
+```
+
+**Cause:** VoxCPM2 internally calls `torch.compile(backend='inductor')` during warmup, which requires `gcc`. On WSL hosts without gcc, this crashes. `torch._dynamo.config.suppress_errors = True` is insufficient — the error occurs before dynamo's fallback intercepts it. The environment variable `TORCH_COMPILE_DISABLE` is not a real PyTorch variable (it's a no-op).
+
+**Fix:** Set `TORCHDYNAMO_DISABLE=1` **before any torch import**. This is done at the top of `generator/voxcpm.py`:
+```python
+os.environ["TORCHDYNAMO_DISABLE"] = "1"  # must be module-level, before torch
+```
+
+**Why it must be module-level:** pydub (imported in generate_segment) pulls in torch indirectly. By the time `_load_model()` runs, torch may already be initialized with dynamo enabled.
+
+---
+
+### segments.json is empty after crash
+
+**Symptom:** `JSONDecodeError: Expecting value: line 1 column 1` when reading segments.json.
+
+**Cause:** `Path.write_text()` truncates the file before writing. A crash during the write leaves a 0-byte file.
+
+**Fix:** `save_plan()` now uses an atomic write: write to `.json.tmp`, then `os.replace()`. On POSIX, rename is atomic — a crash mid-write leaves the old file intact.
+
+**Recovery:** Re-run `python audiobook_gen.py parse <epub>` to rebuild from source, then manually restore `generated_at`/`youtube_video_id` fields from the per-segment `audio/seg*.json` files.
+
+### Chinese text in voice_prompt crashes save_plan
+
+**Symptom:** Generation completes a chapter successfully (MP3 written, `_tmp.wav` cleaned up), then crashes immediately after:
+
+```
+UnicodeEncodeError: 'ascii' codec can't encode characters in position 507-510
+  File "audiobook_gen.py", in save_plan
+    tmp.write_text(json.dumps(plan, ensure_ascii=False, indent=2))
+```
+
+**Cause:** `Path.write_text()` defaults to the system locale encoding, which is ASCII on WSL. When `voice_prompt` contains Chinese characters and `ensure_ascii=False` is used, the resulting string can't be encoded.
+
+**Fix:** Always pass `encoding='utf-8'` to `write_text()`:
+
+```python
+tmp.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding='utf-8')
+```
+
+**Why it was subtle:** Runs with `voice_prompt = None` (default) succeeded silently. The bug only surfaces when a Chinese voice prompt is set — every chapter completes its MP3 but the plan update crashes, so the chapter must be manually recovered from `audio/seg*.json`.
+
+**Scope:** This affected every `write_text()` call in the codebase — `audiobook_gen.py` (3 sites), `generator/voxcpm.py`, `library.py`, `watchdog.py`, and `uploaders/youtube.py`. All have been patched with `encoding='utf-8'`.
+
+> **Chinese support note:** audiobook-gen is designed for Chinese books and voice prompts. All JSON writes use `ensure_ascii=False` + `encoding='utf-8'`, and `PYTHONIOENCODING=utf-8` is required on WSL to prevent stdout crashes from CJK characters in status messages.
+
+## Canonical run command
+
+Always launch generation with the full env:
+
+```bash
+PYTHONIOENCODING=utf-8 \
+  /path/to/miniforge3/envs/research/bin/python audiobook_gen.py generate BOOK_ID \
+  --library /path/to/library \
+  --steps 10
+```
+
+`PYTHONIOENCODING=utf-8` — prevents emoji crash on WSL stdout.
+`TORCHDYNAMO_DISABLE=1` — set automatically inside generator/voxcpm.py; no need to pass externally.
+
 ## Credits
 
 - TTS: [VoxCPM2](https://github.com/OpenBMB/VoxCPM) by OpenBMB

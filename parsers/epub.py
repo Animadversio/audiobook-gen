@@ -220,3 +220,18 @@ def compute_book_id(epub_path: Path) -> str:
     stat = epub_path.stat()
     key = f"{epub_path.name}:{stat.st_size}"
     return hashlib.sha256(key.encode()).hexdigest()[:8]
+
+
+def get_epub_title(epub_path: Path) -> str:
+    """Extract human-readable title from epub metadata. Falls back to filename stem.
+    Trims after '(' to remove long marketing suffixes common in Chinese epubs."""
+    try:
+        book = epub.read_epub(str(epub_path))
+        titles = book.get_metadata('DC', 'title')
+        if titles:
+            raw = titles[0][0].strip()
+            # Trim at first '(' — removes "(副标题/营销文案...)" suffixes
+            return raw.split('(')[0].strip() or raw
+    except Exception:
+        pass
+    return epub_path.stem

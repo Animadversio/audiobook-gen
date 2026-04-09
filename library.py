@@ -101,7 +101,8 @@ class Library:
 
     def _save(self):
         self.index_file.write_text(
-            json.dumps(self._data, ensure_ascii=False, indent=2)
+            json.dumps(self._data, ensure_ascii=False, indent=2),
+            encoding='utf-8',
         )
 
     def book_paths(self, book_id: str) -> BookPaths:

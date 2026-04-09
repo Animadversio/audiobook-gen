@@ -13,6 +13,11 @@ import re
 import tempfile
 from pathlib import Path
 
+# Disable torch dynamo/inductor compilation globally — no C compiler on host (WSL).
+# Must be set before any torch import. suppress_errors alone is insufficient because
+# VoxCPM's internal torch.compile(backend='inductor') raises before dynamo can intercept.
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+
 import numpy as np
 
 _CJK = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf]')
@@ -49,9 +54,6 @@ class AudiobookGenerator:
     def _load_model(self):
         if self._model is not None:
             return
-        import torch._dynamo
-        torch._dynamo.config.suppress_errors = True
-        os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
         from voxcpm import VoxCPM
         print("Loading VoxCPM2 model...")
         # load_denoiser=False is faster and sufficient for audiobook quality
@@ -76,7 +78,7 @@ class AudiobookGenerator:
         import soundfile as sf
         import shutil
         from pydub import AudioSegment
-        # Ensure ffmpeg is found — look in PATH and common conda locations
+        # Ensure ffmpeg is found — pydub caches converter at import, so set it explicitly
         if not shutil.which("ffmpeg"):
             for candidate in [
                 "/home/binxu/miniforge3/envs/research/bin/ffmpeg",
@@ -84,7 +86,9 @@ class AudiobookGenerator:
                 "/usr/local/bin/ffmpeg",
             ]:
                 if Path(candidate).exists():
-                    os.environ["PATH"] = str(Path(candidate).parent) + ":" + os.environ.get("PATH", "")
+                    AudioSegment.converter = candidate
+                    AudioSegment.ffmpeg = candidate
+                    AudioSegment.ffprobe = candidate.replace("ffmpeg", "ffprobe")
                     break
 
         self._load_model()
@@ -140,7 +144,7 @@ class AudiobookGenerator:
             progress_file.write_text(_json.dumps({
                 "chunk_done": j + 1,
                 "chunk_total": total_chunks,
-            }))
+            }), encoding='utf-8')
 
         # Concatenate all chunks
         combined = np.concatenate(parts, axis=-1)

@@ -36,7 +36,7 @@ def _load_credentials(token_path: Path = DEFAULT_TOKEN_PATH) -> Credentials:
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
         data["token"] = creds.token
-        token_path.write_text(json.dumps(data))
+        token_path.write_text(json.dumps(data), encoding='utf-8')
     return creds
 
 

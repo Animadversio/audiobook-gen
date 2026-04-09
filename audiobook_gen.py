@@ -43,10 +43,10 @@ def ipc_send(ipc_dir: str | None, jid: str | None, text: str):
     if not ipc_dir or not jid:
         print(f"[MSG] {text}")
         return
-    msg = {"chatJid": jid, "text": text}
+    msg = {"type": "message", "chatJid": jid, "text": text}
     ts = int(time.time() * 1000)
     ipc_path = Path(ipc_dir) / f"msg_{ts}.json"
-    ipc_path.write_text(json.dumps(msg, ensure_ascii=False))
+    ipc_path.write_text(json.dumps(msg, ensure_ascii=False), encoding='utf-8')
     time.sleep(0.05)  # avoid filename collision on fast machines
 
 
@@ -59,7 +59,10 @@ def load_plan(paths) -> dict:
 
 
 def save_plan(paths, plan: dict):
-    paths.segments_file.write_text(json.dumps(plan, ensure_ascii=False, indent=2))
+    # Atomic write: write to temp file then rename to avoid corruption on crash
+    tmp = paths.segments_file.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding='utf-8')
+    tmp.replace(paths.segments_file)
 
 
 # ──────────────────────────────────────────────
@@ -143,9 +146,10 @@ def cmd_parse(args):
 
     suffix = input_path.suffix.lower()
     if suffix == ".epub":
-        from parsers.epub import extract_chapters_epub, compute_book_id
+        from parsers.epub import extract_chapters_epub, compute_book_id, get_epub_title
         chapters = extract_chapters_epub(input_path)
         book_id = compute_book_id(input_path)
+        book_title = get_epub_title(input_path)
     elif suffix in (".md", ".markdown"):
         from parsers.markdown import extract_chapters_markdown, compute_book_id
         chapters = extract_chapters_markdown(
@@ -156,7 +160,9 @@ def cmd_parse(args):
         print(f"ERROR: Unsupported format: {suffix}", file=sys.stderr)
         sys.exit(1)
 
-    book_title = input_path.stem
+    # book_title set above from epub/markdown metadata; fallback for markdown:
+    if suffix in (".md", ".markdown"):
+        book_title = input_path.stem
 
     # Register in library (creates folder structure)
     paths = lib.register_book(
@@ -253,10 +259,39 @@ def cmd_generate(args):
 
         # Idempotency: skip if already generated with same text
         if mp3_path.exists() and json_path.exists():
-            existing = json.loads(json_path.read_text())
+            try:
+                raw = json_path.read_text(encoding='utf-8')
+                existing = json.loads(raw) if raw.strip() else {}
+            except (json.JSONDecodeError, OSError):
+                existing = {}
             if existing.get("text_hash") == seg["text_hash"]:
                 print(f"[{idx:03d}] Already generated (hash match), skipping.")
                 continue
+            if not existing and mp3_path.exists():
+                # Empty/corrupt JSON but MP3 exists — recover JSON from MP3 metadata
+                import subprocess as _sp
+                r = _sp.run([
+                    str(next(Path(p) for p in [
+                        "/home/binxu/miniforge3/envs/research/bin/ffprobe", "/usr/bin/ffprobe"
+                    ] if Path(p).exists())),
+                    "-v","quiet","-show_entries","format=duration",
+                    "-of","default=noprint_wrappers=1:nokey=1", str(mp3_path)
+                ], capture_output=True, text=True)
+                if r.returncode == 0:
+                    recovered_duration = float(r.stdout.strip())
+                    from datetime import datetime as _dt, timezone as _tz
+                    meta = {k: v for k, v in seg.items()}
+                    meta["steps"] = steps
+                    meta["mp3_path"] = str(mp3_path)
+                    meta["generated_at"] = _dt.fromtimestamp(
+                        mp3_path.stat().st_mtime, tz=_tz.utc).isoformat()
+                    meta["audio_duration_sec"] = recovered_duration
+                    json_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+                    seg["generated_at"] = meta["generated_at"]
+                    seg["audio_duration_sec"] = recovered_duration
+                    save_plan(paths, plan)
+                    print(f"[{idx:03d}] Recovered JSON from MP3 ({recovered_duration:.0f}s), skipping regeneration.")
+                    continue
 
         voice_prompt = seg.get("voice_prompt") or plan.get("voice_prompt")
         voice_ref = seg.get("voice_ref_audio") or plan.get("voice_ref_audio")
@@ -284,7 +319,7 @@ def cmd_generate(args):
         meta = {k: v for k, v in seg.items()}
         meta["steps"] = steps
         meta["mp3_path"] = str(mp3_path)
-        json_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+        json_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
 
         m, s = divmod(int(duration_sec), 60)
         ipc_send(ipc, jid, f"✅ [{i+1}/{total}] **{seg['title']}** — {m}分{s:02d}秒")
