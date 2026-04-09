@@ -74,7 +74,18 @@ class AudiobookGenerator:
         Returns audio duration in seconds.
         """
         import soundfile as sf
+        import shutil
         from pydub import AudioSegment
+        # Ensure ffmpeg is found — look in PATH and common conda locations
+        if not shutil.which("ffmpeg"):
+            for candidate in [
+                "/home/binxu/miniforge3/envs/research/bin/ffmpeg",
+                "/usr/bin/ffmpeg",
+                "/usr/local/bin/ffmpeg",
+            ]:
+                if Path(candidate).exists():
+                    os.environ["PATH"] = str(Path(candidate).parent) + ":" + os.environ.get("PATH", "")
+                    break
 
         self._load_model()
         model = self._model
@@ -82,6 +93,10 @@ class AudiobookGenerator:
 
         chunks = _split_sentences(text, max_chars=max_chars_per_chunk)
         output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Progress file: output_path.with_suffix("._progress.json")
+        progress_file = output_path.with_suffix("._progress.json")
+        total_chunks = len(chunks)
 
         anchor_wav_path = None
         anchor_text = None
@@ -92,8 +107,9 @@ class AudiobookGenerator:
             anchor_wav_path = voice_ref_audio
             anchor_text = None  # no paired text
 
+        import json as _json
         for j, chunk in enumerate(chunks):
-            print(f"  chunk {j+1}/{len(chunks)} ({len(chunk)} chars)...", flush=True)
+            print(f"  chunk {j+1}/{total_chunks} ({len(chunk)} chars)...", flush=True)
 
             if anchor_wav_path is None:
                 # First chunk: generate with voice prompt, save as anchor
@@ -120,6 +136,11 @@ class AudiobookGenerator:
                 wav = model.generate(**kwargs)
 
             parts.append(wav)
+            # Write progress after each chunk completes
+            progress_file.write_text(_json.dumps({
+                "chunk_done": j + 1,
+                "chunk_total": total_chunks,
+            }))
 
         # Concatenate all chunks
         combined = np.concatenate(parts, axis=-1)

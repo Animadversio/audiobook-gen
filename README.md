@@ -208,6 +208,55 @@ Edit `_segments.json` to set `voice_prompt` per segment for mixed-voice books.
 - Upload deduplication prevents double uploads
 - No broad glob deletions
 
+## Troubleshooting
+
+### ffmpeg not found (pydub export fails)
+
+**Symptom:** Generation runs all chunks, then crashes with:
+```
+FileNotFoundError: [Errno 2] No such file or directory: 'ffmpeg'
+```
+The `seg{N}.mp3` file is 0 bytes. The `seg{N}._tmp.wav` (all chunks concatenated) still exists.
+
+**Cause:** pydub calls `ffmpeg` by name but the conda env's bin directory isn't in PATH when running outside an activated conda environment.
+
+**Fix:** The generator auto-detects and adds ffmpeg to PATH. Always run with the full Python path:
+```bash
+/path/to/miniforge3/envs/research/bin/python audiobook_gen.py generate ...
+```
+
+**Recovery (if _tmp.wav survived):** Manually convert without rerunning VoxCPM:
+```bash
+ffmpeg -y -i seg{N}._tmp.wav -codec:a libmp3lame -b:a 64k seg{N}.mp3
+```
+Then write `seg{N}.json` manually (copy from `segments.json`, add `generated_at` and `audio_duration_sec`). Re-running `generate` will skip the recovered segment via hash check.
+
+---
+
+### UnicodeEncodeError on emoji (❌ ✅)
+
+**Symptom:** Crash after generation with:
+```
+UnicodeEncodeError: 'ascii' codec can't encode character '\u274c'
+```
+
+**Cause:** WSL/Linux terminal defaults to ASCII encoding; emoji in status messages fail on stdout/stderr.
+
+**Fix:** Always run with `PYTHONIOENCODING=utf-8`:
+```bash
+PYTHONIOENCODING=utf-8 python audiobook_gen.py generate ...
+```
+
+---
+
+### VoxCPM has no `.to()` method
+
+**Symptom:** `AttributeError: 'VoxCPM' object has no attribute 'to'`
+
+**Cause:** VoxCPM2 manages its own device placement internally — never call `.to(device)`.
+
+**Fix:** Use `VoxCPM.from_pretrained("openbmb/VoxCPM2", load_denoiser=False)` with no device call.
+
 ## Credits
 
 - TTS: [VoxCPM2](https://github.com/OpenBMB/VoxCPM) by OpenBMB
