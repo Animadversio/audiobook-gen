@@ -142,6 +142,8 @@ def render_html(plan: dict, audio_dir: Path | None = None) -> str:
 
     upload_pct = int(done / total * 100) if total else 0
     gen_pct = int(generated / total * 100) if total else 0
+    # upload as % of the generated portion (for inner dark bar)
+    upload_inner_pct = int(done / generated * 100) if generated else 0
     eta = _compute_eta(segs)
 
     rows = []
@@ -225,7 +227,6 @@ def render_html(plan: dict, audio_dir: Path | None = None) -> str:
     .progress-label {{ font-size: 0.85em; color: #555; margin-bottom: 3px; }}
     .progress-bar {{ background: #eee; border-radius: 8px; height: 16px; }}
     .progress-fill-green {{ background: #28a745; height: 100%; border-radius: 8px; transition: width 0.5s; }}
-    .progress-fill-blue {{ background: #007bff; height: 100%; border-radius: 8px; transition: width 0.5s; }}
     .stats {{ display: flex; gap: 2em; margin: 1em 0 1.5em; flex-wrap: wrap; }}
     .stat {{ text-align: center; }}
     .stat-num {{ font-size: 2em; font-weight: bold; color: #28a745; }}
@@ -246,12 +247,15 @@ def render_html(plan: dict, audio_dir: Path | None = None) -> str:
   </div>
 
   <div class="progress-wrap">
-    <div class="progress-label">生成进度：{generated}/{total} 段  <span class="eta-box">⏱ ETA {eta}</span></div>
-    <div class="progress-bar"><div class="progress-fill-blue" style="width:{gen_pct}%"></div></div>
-  </div>
-  <div class="progress-wrap">
-    <div class="progress-label">上传进度：{done}/{total} 段 ({upload_pct}%)</div>
-    <div class="progress-bar"><div class="progress-fill-green" style="width:{upload_pct}%"></div></div>
+    <div class="progress-label" style="display:flex;justify-content:space-between;align-items:center">
+      <span>进度：{generated}/{total} 段已生成 ({gen_pct}%) &nbsp;·&nbsp; {done} 已上传</span>
+      <span class="eta-box">⏱ ETA {eta}</span>
+    </div>
+    <div class="progress-bar" style="position:relative;overflow:hidden">
+      <div style="width:{gen_pct}%;background:#28a745;height:100%;border-radius:8px;position:relative">
+        <div style="width:{upload_inner_pct}%;background:#155724;height:100%;border-radius:8px 0 0 8px;position:absolute;top:0;left:0"></div>
+      </div>
+    </div>
   </div>
 
   <div class="stats">
