@@ -7,26 +7,32 @@ Usage:
     python audiobook_gen.py run book.epub \
         --jid dc:CHANNEL_ID \
         --ipc /path/to/ipc \
-        --outdir /tmp/audiobook \
+        --library ~/audiobook-library \
         --playlist YOUTUBE_PLAYLIST_ID \
         --steps 10
 
     # Individual phases
-    python audiobook_gen.py parse book.epub --outdir /tmp/audiobook
-    python audiobook_gen.py generate /tmp/audiobook/abc123_segments.json --steps 10
-    python audiobook_gen.py upload /tmp/audiobook/abc123_segments.json --playlist PL...
-    python audiobook_gen.py dashboard /tmp/audiobook/abc123_segments.json --port 8765
+    python audiobook_gen.py parse book.epub
+    python audiobook_gen.py generate a3f8c12e --steps 10
+    python audiobook_gen.py upload a3f8c12e --playlist PL...
+    python audiobook_gen.py dashboard a3f8c12e --port 8765
+    python audiobook_gen.py list
+
+Library root priority:
+    --library arg  >  AUDIOBOOK_LIBRARY env var  >  ~/.local/share/audiobook-gen
 """
 
 import argparse
 import hashlib
 import json
-import math
 import os
 import sys
 import time
 from pathlib import Path
 from datetime import datetime, timezone
+
+from library import Library, resolve_library_root
+
 
 # ──────────────────────────────────────────────
 # IPC / Discord messaging
@@ -41,18 +47,19 @@ def ipc_send(ipc_dir: str | None, jid: str | None, text: str):
     ts = int(time.time() * 1000)
     ipc_path = Path(ipc_dir) / f"msg_{ts}.json"
     ipc_path.write_text(json.dumps(msg, ensure_ascii=False))
+    time.sleep(0.05)  # avoid filename collision on fast machines
 
 
 # ──────────────────────────────────────────────
 # Segment plan I/O
 # ──────────────────────────────────────────────
 
-def load_segments(segments_file: Path) -> dict:
-    return json.loads(segments_file.read_text())
+def load_plan(paths) -> dict:
+    return json.loads(paths.segments_file.read_text())
 
 
-def save_segments(segments_file: Path, plan: dict):
-    segments_file.write_text(json.dumps(plan, ensure_ascii=False, indent=2))
+def save_plan(paths, plan: dict):
+    paths.segments_file.write_text(json.dumps(plan, ensure_ascii=False, indent=2))
 
 
 # ──────────────────────────────────────────────
@@ -60,22 +67,21 @@ def save_segments(segments_file: Path, plan: dict):
 # ──────────────────────────────────────────────
 
 def estimate_duration(char_count: int, text: str) -> str:
-    """Rough TTS duration estimate."""
     cjk = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
     ratio = cjk / max(len(text), 1)
-    chars_per_min = 420 if ratio > 0.3 else 900
-    mins = char_count / chars_per_min
+    cpm = 420 if ratio > 0.3 else 900
+    mins = char_count / cpm
     if mins < 1:
         return f"~{int(mins*60)}sec"
     return f"~{int(mins)}min"
 
 
 def format_segment_table(plan: dict) -> str:
-    """Format the segmentation plan as a Discord-friendly markdown table."""
     book_title = plan.get("book_title", "未知书名")
+    book_id = plan.get("book_id", "?")
     segs = plan["segments"]
     lines = [
-        f"**《{book_title}》分段预览 — 共{len(segs)}段**\n",
+        f"**《{book_title}》分段预览** (book_id: `{book_id}`) — 共{len(segs)}段\n",
         "```",
         f"{'#':>4}  {'标题':<35}  {'字数':>6}  {'预估时长':>9}  状态",
         "─" * 75,
@@ -90,7 +96,7 @@ def format_segment_table(plan: dict) -> str:
         lines.append(f"{idx:>4}  {title:<35}  {chars:>6}  {dur:>9}  {status}")
     lines.append("```")
     lines.append(
-        '\n回复 **"确认"** 继续，或说修改指令：\n'
+        '\n回复 **"确认"** 继续，或给出修改指令：\n'
         '• "合并第3和第4段"\n'
         '• "跳过第15段"\n'
         '• "第2段改名为逐梦之旅"'
@@ -98,15 +104,28 @@ def format_segment_table(plan: dict) -> str:
     return "\n".join(lines)
 
 
-def format_voice_prompt(plan: dict) -> str:
+def format_voice_prompt_msg() -> str:
     return (
         "**音色设置**（可选）：\n\n"
         "A) 整本书统一音色 — 请描述，如 `平静温和的女声播音员`\n"
         "B) 发送参考音频文件（.wav/.mp3）到此对话，用于声音克隆\n"
-        "C) 按段落分别指定（回复后我会逐段询问）\n"
-        "D) 无条件生成（跳过）\n\n"
-        "请回复 A/B/C/D 或直接输入音色描述："
+        "C) 无条件生成（跳过）\n\n"
+        "请回复 A/B/C 或直接输入音色描述："
     )
+
+
+# ──────────────────────────────────────────────
+# Resolve book_id arg (prefix or full)
+# ──────────────────────────────────────────────
+
+def resolve_book(lib: Library, book_id_arg: str):
+    """Find BookPaths from a book_id prefix or title substring."""
+    match = lib.find_book(book_id_arg)
+    if not match:
+        print(f"ERROR: No book found matching '{book_id_arg}'", file=sys.stderr)
+        lib.print_library()
+        sys.exit(1)
+    return lib.book_paths(match["book_id"]), match
 
 
 # ──────────────────────────────────────────────
@@ -114,10 +133,13 @@ def format_voice_prompt(plan: dict) -> str:
 # ──────────────────────────────────────────────
 
 def cmd_parse(args):
-    """Parse EPUB/MD → generate segments JSON → send table to Discord."""
-    input_path = Path(args.input)
-    outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    """Parse EPUB/MD → register in library → send segment table to Discord."""
+    input_path = Path(args.input).expanduser().resolve()
+    if not input_path.exists():
+        print(f"ERROR: File not found: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    lib = Library(resolve_library_root(getattr(args, "library", None)))
 
     suffix = input_path.suffix.lower()
     if suffix == ".epub":
@@ -126,13 +148,26 @@ def cmd_parse(args):
         book_id = compute_book_id(input_path)
     elif suffix in (".md", ".markdown"):
         from parsers.markdown import extract_chapters_markdown, compute_book_id
-        chapters = extract_chapters_markdown(input_path, heading_level=getattr(args, "heading_level", 1))
+        chapters = extract_chapters_markdown(
+            input_path, heading_level=getattr(args, "heading_level", 1)
+        )
         book_id = compute_book_id(input_path)
     else:
-        print(f"Unsupported format: {suffix}", file=sys.stderr)
+        print(f"ERROR: Unsupported format: {suffix}", file=sys.stderr)
         sys.exit(1)
 
     book_title = input_path.stem
+
+    # Register in library (creates folder structure)
+    paths = lib.register_book(
+        book_id=book_id,
+        title=book_title,
+        input_file=str(input_path),
+        youtube_playlist=getattr(args, "playlist", None),
+    )
+
+    # Copy source file to library (optional archival)
+    lib.copy_source(book_id, input_path)
 
     # Build segment plan
     segments = []
@@ -160,9 +195,9 @@ def cmd_parse(args):
         "book_id": book_id,
         "book_title": book_title,
         "input_file": str(input_path),
-        "outdir": str(outdir),
+        "library_root": str(lib.root),
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "voice_prompt": None,       # global voice (can be overridden per-segment)
+        "voice_prompt": None,
         "voice_ref_audio": None,
         "steps": getattr(args, "steps", 10),
         "confirmed": False,
@@ -170,17 +205,19 @@ def cmd_parse(args):
         "segments": segments,
     }
 
-    segments_file = outdir / f"{book_id}_segments.json"
-    save_segments(segments_file, plan)
-    print(f"Segments saved: {segments_file}")
+    save_plan(paths, plan)
+    lib.update_book_progress(book_id, plan)
+
+    print(f"Book registered: {book_id}")
+    print(f"  Library: {lib.root / book_id}/")
+    print(f"  Segments: {paths.segments_file}")
+    print(f"  Parsed {len(segments)} segments")
 
     # Send table to Discord
     table = format_segment_table(plan)
     ipc_send(getattr(args, "ipc", None), getattr(args, "jid", None), table)
 
-    print(f"\nParsed {len(segments)} segments. Waiting for user confirmation via Discord.")
-    print(f"Segments file: {segments_file}")
-    return str(segments_file)
+    return book_id
 
 
 # ──────────────────────────────────────────────
@@ -189,14 +226,15 @@ def cmd_parse(args):
 
 def cmd_generate(args):
     """Generate audio for all confirmed, non-skipped segments."""
-    segments_file = Path(args.segments_file)
-    plan = load_segments(segments_file)
+    lib = Library(resolve_library_root(getattr(args, "library", None)))
+    paths, _ = resolve_book(lib, args.book_id)
+    plan = load_plan(paths)
 
     if not plan.get("confirmed"):
-        print("ERROR: Segments not confirmed yet. Have user confirm via Discord first.", file=sys.stderr)
+        print("ERROR: Segments not confirmed. Confirm via Discord or set confirmed=true in segments.json.",
+              file=sys.stderr)
         sys.exit(1)
 
-    outdir = Path(plan["outdir"])
     book_id = plan["book_id"]
     steps = getattr(args, "steps", None) or plan.get("steps", 10)
     jid = getattr(args, "jid", None)
@@ -210,10 +248,10 @@ def cmd_generate(args):
 
     for i, seg in enumerate(segs_to_run):
         idx = seg["seg_index"]
-        mp3_path = outdir / f"{book_id}_seg{idx:04d}.mp3"
-        json_path = outdir / f"{book_id}_seg{idx:04d}.json"
+        mp3_path = paths.seg_mp3(idx)
+        json_path = paths.seg_json(idx)
 
-        # Idempotency check
+        # Idempotency: skip if already generated with same text
         if mp3_path.exists() and json_path.exists():
             existing = json.loads(json_path.read_text())
             if existing.get("text_hash") == seg["text_hash"]:
@@ -239,7 +277,8 @@ def cmd_generate(args):
         # Update segment metadata
         seg["generated_at"] = datetime.now(timezone.utc).isoformat()
         seg["audio_duration_sec"] = duration_sec
-        save_segments(segments_file, plan)
+        save_plan(paths, plan)
+        lib.update_book_progress(book_id, plan)
 
         # Write paired metadata JSON
         meta = {k: v for k, v in seg.items()}
@@ -247,9 +286,8 @@ def cmd_generate(args):
         meta["mp3_path"] = str(mp3_path)
         json_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
 
-        mins = int(duration_sec // 60)
-        secs = int(duration_sec % 60)
-        ipc_send(ipc, jid, f"✅ [{i+1}/{total}] **{seg['title']}** — {mins}分{secs}秒")
+        m, s = divmod(int(duration_sec), 60)
+        ipc_send(ipc, jid, f"✅ [{i+1}/{total}] **{seg['title']}** — {m}分{s:02d}秒")
 
 
 # ──────────────────────────────────────────────
@@ -258,11 +296,15 @@ def cmd_generate(args):
 
 def cmd_upload(args):
     """Upload generated MP3s to YouTube with deduplication."""
-    segments_file = Path(args.segments_file)
-    plan = load_segments(segments_file)
-    outdir = Path(plan["outdir"])
-    book_id = plan["book_id"]
-    playlist_id = args.playlist
+    lib = Library(resolve_library_root(getattr(args, "library", None)))
+    paths, book_meta = resolve_book(lib, args.book_id)
+    plan = load_plan(paths)
+
+    playlist_id = getattr(args, "playlist", None) or book_meta.get("youtube_playlist")
+    if not playlist_id:
+        print("ERROR: No playlist ID. Use --playlist or set it during parse.", file=sys.stderr)
+        sys.exit(1)
+
     jid = getattr(args, "jid", None)
     ipc = getattr(args, "ipc", None)
 
@@ -273,7 +315,7 @@ def cmd_upload(args):
         if seg.get("skip"):
             continue
         idx = seg["seg_index"]
-        mp3_path = outdir / f"{book_id}_seg{idx:04d}.mp3"
+        mp3_path = paths.seg_mp3(idx)
         if not mp3_path.exists():
             print(f"[{idx:03d}] MP3 not found, skipping upload.")
             continue
@@ -290,50 +332,60 @@ def cmd_upload(args):
 
         seg["youtube_video_id"] = result["video_id"]
         seg["youtube_uploaded_at"] = datetime.now(timezone.utc).isoformat()
-        save_segments(segments_file, plan)
-        ipc_send(ipc, jid, f"📤 上传完成：**{seg['title']}** → https://youtu.be/{result['video_id']}")
+        save_plan(paths, plan)
+        lib.update_book_progress(plan["book_id"], plan)
+        ipc_send(ipc, jid, f"📤 **{seg['title']}** → https://youtu.be/{result['video_id']}")
+
+    # Update playlist in library index
+    if playlist_id:
+        lib.register_book(plan["book_id"], plan["book_title"], plan["input_file"], playlist_id)
 
 
 # ──────────────────────────────────────────────
-# Dashboard phase
+# Dashboard
 # ──────────────────────────────────────────────
 
 def cmd_dashboard(args):
-    """Start read-only dashboard HTTP server."""
+    """Start read-only dashboard server for a book."""
+    lib = Library(resolve_library_root(getattr(args, "library", None)))
+    paths, _ = resolve_book(lib, args.book_id)
     from dashboard.server import start_server
-    start_server(
-        segments_file=Path(args.segments_file),
-        port=getattr(args, "port", 8765),
-    )
+    start_server(segments_file=paths.segments_file, port=getattr(args, "port", 8765))
 
 
 # ──────────────────────────────────────────────
-# Full pipeline (run)
+# List library
+# ──────────────────────────────────────────────
+
+def cmd_list(args):
+    """List all books in the library."""
+    lib = Library(resolve_library_root(getattr(args, "library", None)))
+    lib.print_library()
+
+
+# ──────────────────────────────────────────────
+# Full pipeline
 # ──────────────────────────────────────────────
 
 def cmd_run(args):
-    """
-    Full pipeline: parse → [Discord pause] → generate → upload.
-    The 'confirmation' and 'voice selection' pauses are handled externally
-    by the NanoClaw Discord skill — this script is called in two phases:
-      Phase 1: parse (then skill waits for user confirmation)
-      Phase 2: generate + upload (called after confirmation)
-    """
-    # For direct CLI use, run parse then generate (no Discord pause)
-    segments_file = Path(cmd_parse(args))
-    plan = load_segments(segments_file)
+    """Full pipeline: parse → generate → upload (auto-confirm when no Discord)."""
+    book_id = cmd_parse(args)
+    lib = Library(resolve_library_root(getattr(args, "library", None)))
+    paths = lib.book_paths(book_id)
+    plan = load_plan(paths)
 
     # Auto-confirm if not using Discord
-    if not args.jid:
+    if not getattr(args, "jid", None):
         plan["confirmed"] = True
         plan["voice_confirmed"] = True
-        if args.voice:
+        if getattr(args, "voice", None):
             plan["voice_prompt"] = args.voice
-        save_segments(segments_file, plan)
+        if getattr(args, "voice_ref_audio", None):
+            plan["voice_ref_audio"] = args.voice_ref_audio
+        save_plan(paths, plan)
 
-    args.segments_file = str(segments_file)
+    args.book_id = book_id
     cmd_generate(args)
-
     if getattr(args, "playlist", None):
         cmd_upload(args)
 
@@ -346,45 +398,51 @@ def main():
     parser = argparse.ArgumentParser(description="Audiobook Generator using VoxCPM2")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # Common args
-    def add_common(p):
+    def add_common(p, book_id=False):
+        p.add_argument("--library", help="Library root directory (or set AUDIOBOOK_LIBRARY env var)")
         p.add_argument("--jid", help="Discord channel JID for progress messages")
         p.add_argument("--ipc", help="NanoClaw IPC directory")
-        p.add_argument("--outdir", default="/tmp/audiobook", help="Output directory")
+        if book_id:
+            p.add_argument("book_id", help="book_id prefix or title substring")
 
     # parse
-    p_parse = sub.add_parser("parse", help="Parse EPUB/MD and generate segment plan")
+    p_parse = sub.add_parser("parse", help="Parse EPUB/MD and register in library")
     p_parse.add_argument("input", help="Input EPUB or Markdown file")
-    p_parse.add_argument("--heading-level", type=int, default=1, help="Markdown heading level to split on")
+    p_parse.add_argument("--heading-level", type=int, default=1)
+    p_parse.add_argument("--playlist", help="YouTube playlist ID to associate")
+    p_parse.add_argument("--steps", type=int, default=10)
     add_common(p_parse)
     p_parse.set_defaults(func=cmd_parse)
 
     # generate
     p_gen = sub.add_parser("generate", help="Generate audio for confirmed segments")
-    p_gen.add_argument("segments_file", help="Path to *_segments.json")
-    p_gen.add_argument("--steps", type=int, default=10, help="VoxCPM2 diffusion steps")
-    add_common(p_gen)
+    p_gen.add_argument("--steps", type=int, default=10)
+    add_common(p_gen, book_id=True)
     p_gen.set_defaults(func=cmd_generate)
 
     # upload
     p_up = sub.add_parser("upload", help="Upload generated MP3s to YouTube")
-    p_up.add_argument("segments_file", help="Path to *_segments.json")
     p_up.add_argument("--playlist", help="YouTube playlist ID")
-    add_common(p_up)
+    add_common(p_up, book_id=True)
     p_up.set_defaults(func=cmd_upload)
 
     # dashboard
     p_dash = sub.add_parser("dashboard", help="Start read-only dashboard server")
-    p_dash.add_argument("segments_file", help="Path to *_segments.json")
     p_dash.add_argument("--port", type=int, default=8765)
+    add_common(p_dash, book_id=True)
     p_dash.set_defaults(func=cmd_dashboard)
 
-    # run (full pipeline)
+    # list
+    p_list = sub.add_parser("list", help="List all books in the library")
+    add_common(p_list)
+    p_list.set_defaults(func=cmd_list)
+
+    # run
     p_run = sub.add_parser("run", help="Full pipeline (parse + generate + upload)")
     p_run.add_argument("input", help="Input EPUB or Markdown file")
     p_run.add_argument("--steps", type=int, default=10)
     p_run.add_argument("--playlist", help="YouTube playlist ID")
-    p_run.add_argument("--voice", help="Voice description (skip Discord voice selection)")
+    p_run.add_argument("--voice", help="Voice description")
     p_run.add_argument("--voice-ref", dest="voice_ref_audio", help="Reference audio for voice cloning")
     add_common(p_run)
     p_run.set_defaults(func=cmd_run)

@@ -24,43 +24,106 @@ pip install voxcpm  # requires CUDA or Apple Silicon
 
 ffmpeg must be installed for YouTube upload (MP3 → MP4 conversion).
 
+## Library
+
+All books are stored in a local **library** — one folder per book, with a global index.
+
+### Library root (in priority order)
+
+```bash
+# 1. CLI argument
+python audiobook_gen.py parse book.epub --library ~/my-audiobooks
+
+# 2. Environment variable
+export AUDIOBOOK_LIBRARY=~/my-audiobooks
+
+# 3. Default
+~/.local/share/audiobook-gen/    # Linux / WSL
+~/Library/audiobook-gen/         # macOS
+```
+
+### Library directory structure
+
+```
+~/audiobook-library/
+  library.json                        ← global index of all books
+
+  a3f8c12e/                           ← book_id (8-char SHA256)
+    meta.json                         ← book metadata + progress summary
+    segments.json                     ← full segment plan (source of truth)
+    dashboard.html                    ← static status page snapshot
+    audio/
+      seg0001.mp3                     ← generated audio
+      seg0001.json                    ← paired metadata with text hash
+      seg0002.mp3
+      seg0002.json
+      ...
+    source/
+      original.epub                   ← archived copy of source file
+
+  b7e2a91f/                           ← another book
+    ...
+```
+
+`book_id` = 8-char SHA256 of (filename + file size) — stable, ASCII-safe, no Unicode issues.
+
+### List your library
+
+```bash
+python audiobook_gen.py list
+```
+
+Output:
+```
+   book_id  Done  Total  Duration  Title
+──────────────────────────────────────────────────────────────────────
+  a3f8c12e    13     13    5h42m   我看见的世界：李飞飞自传
+  b7e2a91f     3      8    1h12m   另一本书
+
+Library root: /home/user/.local/share/audiobook-gen
+```
+
 ## Quick Start
 
 ### 1. Parse — Preview segments
 
 ```bash
-python audiobook_gen.py parse book.epub --outdir /tmp/audiobook
+python audiobook_gen.py parse book.epub
 ```
 
-This generates `/tmp/audiobook/{book_id}_segments.json` and prints a chapter table.
+Registers the book in your library, generates `segments.json`, and prints the chapter table.
 If using NanoClaw, it sends the table to Discord and waits for your confirmation.
 
 ### 2. Confirm and optionally edit
 
-The NanoClaw Discord skill handles this interactively. Or manually edit the JSON:
+The NanoClaw Discord skill handles this interactively. Or manually edit `segments.json`:
 ```json
-// Set confirmed: true when ready
-// Set skip: true for segments to exclude
-// Set voice_prompt: "平静温和的女声播音员" globally or per-segment
+{
+  "confirmed": true,
+  "voice_prompt": "平静温和的女声播音员",
+  "segments": [
+    {"seg_index": 15, "skip": true, ...}
+  ]
+}
 ```
 
 ### 3. Generate audio
 
 ```bash
-python audiobook_gen.py generate /tmp/audiobook/{book_id}_segments.json --steps 10
+# Use book_id prefix (first 4+ chars is enough)
+python audiobook_gen.py generate a3f8 --steps 10
 ```
 
 ### 4. Upload to YouTube
 
 ```bash
-python audiobook_gen.py upload /tmp/audiobook/{book_id}_segments.json \
-  --playlist PLxxxxxxxxxxxx
+python audiobook_gen.py upload a3f8 --playlist PLxxxxxxxxxxxx
 ```
 
 ### 5. View dashboard
 
 ```bash
-python audiobook_gen.py dashboard /tmp/audiobook/{book_id}_segments.json --port 8765
+python audiobook_gen.py dashboard a3f8 --port 8765
 # Share publicly:
 ssh -R 80:localhost:8765 nokey@localhost.run
 ```
@@ -69,28 +132,10 @@ ssh -R 80:localhost:8765 nokey@localhost.run
 
 ```bash
 python audiobook_gen.py run book.epub \
-  --outdir /tmp/audiobook \
   --voice "平静温和的女声播音员" \
   --playlist PLxxxxxxxxxxxx \
   --steps 10
 ```
-
-## File Naming Convention
-
-Local files use a code-friendly naming scheme:
-
-```
-{outdir}/
-  {book_id}_segments.json       # master segment plan (single source of truth)
-  {book_id}_seg0001.mp3         # audio for segment 1
-  {book_id}_seg0001.json        # paired metadata for segment 1
-  {book_id}_seg0002.mp3
-  {book_id}_seg0002.json
-  ...
-  {book_id}_dashboard.html      # static dashboard snapshot
-```
-
-`book_id` = 8-char SHA256 of (filename + file size) — stable, ASCII-safe.
 
 ## Metadata JSON Format
 
