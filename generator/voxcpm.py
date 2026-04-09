@@ -2,35 +2,24 @@
 VoxCPM2 TTS generator for audiobook production.
 
 Features:
-- Text chunking (respects sentence boundaries, max 400 chars Chinese / 600 English)
-- Voice prompt prefix on every chunk (for consistent voice across segments)
-- Reference audio support for voice cloning (generate_with_prompt_cache)
+- Text chunking (respects sentence boundaries, max 400 chars)
+- First chunk generates with voice prompt → saved as anchor WAV
+- Subsequent chunks use prompt_wav_path voice cloning for consistency
 - Outputs MP3 via pydub; returns duration in seconds
-- KV cache anchor per chapter for voice consistency
 """
 
-import re
 import os
+import re
 import tempfile
 from pathlib import Path
 
+import numpy as np
+
 _CJK = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf]')
-
-# Sentence boundary patterns
-_SENT_BOUNDARY_ZH = re.compile(r'(?<=[。！？…])\s*')
-_SENT_BOUNDARY_EN = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
-
-
-def _has_cjk(text: str) -> bool:
-    return bool(_CJK.search(text))
 
 
 def _split_sentences(text: str, max_chars: int = 400) -> list[str]:
-    """
-    Split text into TTS-safe chunks at sentence boundaries.
-    Chinese: split on 。！？… | English: split on .!? followed by capital.
-    """
-    # Unified sentence splitter
+    """Split text into TTS-safe chunks at sentence boundaries."""
     parts = re.split(r'(?<=[。！？…\.!?])\s*', text)
     chunks = []
     current = ""
@@ -44,7 +33,7 @@ def _split_sentences(text: str, max_chars: int = 400) -> list[str]:
             current += part
     if current.strip():
         chunks.append(current.strip())
-    return chunks
+    return chunks or [text]
 
 
 class AudiobookGenerator:
@@ -53,63 +42,21 @@ class AudiobookGenerator:
     Loads model once, reuses across segments.
     """
 
-    def __init__(self, steps: int = 10, device: str = "cuda"):
+    def __init__(self, steps: int = 10):
         self.steps = steps
-        self.device = device
         self._model = None
-        self._tokenizer = None
 
     def _load_model(self):
         if self._model is not None:
             return
-
-        import torch
-        # Required workaround: suppress torch.compile errors (no gcc on host)
+        import torch._dynamo
         torch._dynamo.config.suppress_errors = True
         os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
-
         from voxcpm import VoxCPM
         print("Loading VoxCPM2 model...")
-        self._model = VoxCPM.from_pretrained("openbmb/VoxCPM2")
-        self._model = self._model.to(self.device)
-        self._model.eval()
-        print("VoxCPM2 model loaded.")
-
-    def _chunks_to_wav(
-        self,
-        chunks: list[str],
-        voice_prompt: str | None,
-        voice_ref_audio: str | None,
-    ) -> list:
-        """Generate WAV audio arrays for a list of text chunks."""
-        import torch
-        self._load_model()
-
-        wav_arrays = []
-
-        if voice_ref_audio and Path(voice_ref_audio).exists():
-            # Voice cloning via KV cache anchor
-            import torchaudio
-            ref_wav, ref_sr = torchaudio.load(voice_ref_audio)
-            if ref_sr != 24000:
-                ref_wav = torchaudio.functional.resample(ref_wav, ref_sr, 24000)
-            prompt_cache = self._model.build_prompt_cache(ref_wav)
-
-            for chunk in chunks:
-                text = f"({voice_prompt}){chunk}" if voice_prompt else chunk
-                with torch.no_grad():
-                    wav = self._model.generate_with_prompt_cache(
-                        text, prompt_cache, num_steps=self.steps
-                    )
-                wav_arrays.append(wav.cpu().numpy())
-        else:
-            for chunk in chunks:
-                text = f"({voice_prompt}){chunk}" if voice_prompt else chunk
-                with torch.no_grad():
-                    wav = self._model.generate(text, num_steps=self.steps)
-                wav_arrays.append(wav.cpu().numpy())
-
-        return wav_arrays
+        # load_denoiser=False is faster and sufficient for audiobook quality
+        self._model = VoxCPM.from_pretrained("openbmb/VoxCPM2", load_denoiser=False)
+        print("VoxCPM2 model ready.")
 
     def generate_segment(
         self,
@@ -121,29 +68,67 @@ class AudiobookGenerator:
     ) -> float:
         """
         Generate audio for a full chapter segment.
-        Splits into TTS-safe chunks, generates each, concatenates to MP3.
+        - Chunk 1: generated with voice_prompt prefix → saved as anchor
+        - Chunks 2+: voice-cloned from anchor via prompt_wav_path
+
         Returns audio duration in seconds.
         """
-        import numpy as np
-        try:
-            from pydub import AudioSegment
-        except ImportError:
-            raise RuntimeError("pydub required: pip install pydub")
+        import soundfile as sf
+        from pydub import AudioSegment
+
+        self._load_model()
+        model = self._model
+        sample_rate = model.tts_model.sample_rate
 
         chunks = _split_sentences(text, max_chars=max_chars_per_chunk)
-        if not chunks:
-            raise ValueError("No text chunks to generate")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        wav_arrays = self._chunks_to_wav(chunks, voice_prompt, voice_ref_audio)
+        anchor_wav_path = None
+        anchor_text = None
+        parts = []
+
+        # If caller provides a reference audio, use it as the voice anchor
+        if voice_ref_audio and Path(voice_ref_audio).exists():
+            anchor_wav_path = voice_ref_audio
+            anchor_text = None  # no paired text
+
+        for j, chunk in enumerate(chunks):
+            print(f"  chunk {j+1}/{len(chunks)} ({len(chunk)} chars)...", flush=True)
+
+            if anchor_wav_path is None:
+                # First chunk: generate with voice prompt, save as anchor
+                prompt_text = f"({voice_prompt}){chunk}" if voice_prompt else chunk
+                wav = model.generate(
+                    text=prompt_text,
+                    cfg_value=2.0,
+                    inference_timesteps=self.steps,
+                )
+                # Save anchor alongside output
+                anchor_wav_path = str(output_path.with_suffix("._anchor.wav"))
+                sf.write(anchor_wav_path, wav, sample_rate)
+                anchor_text = chunk
+            else:
+                # Subsequent chunks: clone voice from anchor
+                kwargs = dict(
+                    text=chunk,
+                    prompt_wav_path=anchor_wav_path,
+                    cfg_value=2.0,
+                    inference_timesteps=self.steps,
+                )
+                if anchor_text:
+                    kwargs["prompt_text"] = anchor_text
+                wav = model.generate(**kwargs)
+
+            parts.append(wav)
 
         # Concatenate all chunks
-        combined = np.concatenate(wav_arrays, axis=-1)
+        combined = np.concatenate(parts, axis=-1)
 
-        # Convert to pydub AudioSegment (VoxCPM2 outputs 24kHz mono)
-        pcm = (combined * 32767).astype(np.int16).tobytes()
-        audio = AudioSegment(pcm, frame_rate=24000, sample_width=2, channels=1)
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Save as WAV first, then convert to MP3
+        tmp_wav = str(output_path.with_suffix("._tmp.wav"))
+        sf.write(tmp_wav, combined, sample_rate)
+        audio = AudioSegment.from_wav(tmp_wav)
         audio.export(str(output_path), format="mp3", bitrate="64k")
+        Path(tmp_wav).unlink(missing_ok=True)
 
         return len(audio) / 1000.0  # duration in seconds
