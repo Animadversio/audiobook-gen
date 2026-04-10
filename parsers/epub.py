@@ -230,8 +230,10 @@ def get_epub_title(epub_path: Path) -> str:
         titles = book.get_metadata('DC', 'title')
         if titles:
             raw = titles[0][0].strip()
-            # Trim at first '(' — removes "(副标题/营销文案...)" suffixes
-            return raw.split('(')[0].strip() or raw
+            # Trim at first '(' or '（' — removes marketing suffixes common in Chinese epubs
+            import re
+            trimmed = re.split(r'[(\uff08]', raw, maxsplit=1)[0].strip()
+            return trimmed or raw
     except Exception:
         pass
     return epub_path.stem
