@@ -381,11 +381,18 @@ def cmd_upload(args):
 # ──────────────────────────────────────────────
 
 def cmd_dashboard(args):
-    """Start read-only dashboard server for a book."""
+    """Start read-only dashboard server. Without book_id shows library index."""
     lib = Library(resolve_library_root(getattr(args, "library", None)))
-    paths, _ = resolve_book(lib, args.book_id)
+    book_id = getattr(args, "book_id", None) or None
+    if book_id:
+        # Validate book exists
+        resolve_book(lib, book_id)
     from dashboard.server import start_server
-    start_server(segments_file=paths.segments_file, port=getattr(args, "port", 8765))
+    start_server(
+        library_root=lib.root,
+        port=getattr(args, "port", 8765),
+        single_book_id=book_id,
+    )
 
 
 # ──────────────────────────────────────────────
@@ -462,9 +469,10 @@ def main():
     p_up.set_defaults(func=cmd_upload)
 
     # dashboard
-    p_dash = sub.add_parser("dashboard", help="Start read-only dashboard server")
+    p_dash = sub.add_parser("dashboard", help="Start read-only dashboard server (all books or one)")
+    p_dash.add_argument("book_id", nargs="?", default=None, help="book_id prefix (optional; omit to show library index)")
     p_dash.add_argument("--port", type=int, default=8765)
-    add_common(p_dash, book_id=True)
+    add_common(p_dash, book_id=False)
     p_dash.set_defaults(func=cmd_dashboard)
 
     # list

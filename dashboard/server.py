@@ -1,34 +1,73 @@
 """
 Read-only audiobook dashboard server.
 
-Serves a self-refreshing HTML page showing:
-- Book title, voice settings, overall progress
-- Per-segment table: title, chars, status, duration, YouTube link
-- Error details for failed segments
-- Auto-refresh every 30 seconds
+Routes:
+  /                    → Library index: all books, progress summary
+  /book/<book_id>      → Per-book detail: segment table, ETA, YouTube links
+
+Serves self-refreshing HTML pages (dark theme, GitHub Dark palette).
 
 Usage:
-    python -m dashboard.server /tmp/audiobook/abc123_segments.json --port 8765
+    python -m dashboard.server --library /path/to/library --port 8765
+    python -m dashboard.server --library /path/to/library --book-id 2c3a6054  # single book
 
-Then share via: ssh -R 80:localhost:8765 nokey@localhost.run
+Then expose via: cloudflared tunnel --url localhost:8765
 """
 
 import json
 import http.server
-import threading
-import time
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse
+
+from library import Library, BookPaths
+
+DARK_CSS = """
+    body { font-family: -apple-system, sans-serif; max-width: 1200px; margin: 2em auto; padding: 0 1em; background: #0d1117; color: #e6edf3; }
+    h1, h2 { color: #e6edf3; }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .meta { color: #8b949e; margin-bottom: 1.5em; }
+    .progress-wrap { margin: 0.5em 0 1.5em; }
+    .progress-label { font-size: 0.85em; color: #8b949e; margin-bottom: 3px; }
+    .progress-bar { background: #21262d; border-radius: 8px; height: 16px; }
+    .progress-fill-green { background: #238636; height: 100%; border-radius: 8px; transition: width 0.5s; }
+    .stats { display: flex; gap: 2em; margin: 1em 0 1.5em; flex-wrap: wrap; }
+    .stat { text-align: center; }
+    .stat-num { font-size: 2em; font-weight: bold; color: #3fb950; }
+    .stat-label { color: #8b949e; font-size: 0.9em; }
+    .eta-box { display:inline-block; background:#272115; border:1px solid #9e6a03; border-radius:6px; padding:4px 12px; font-weight:bold; color:#d29922; margin-left:1em; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1em; }
+    th { background: #161b22; color: #8b949e; padding: 8px 12px; text-align: left; border-bottom: 1px solid #30363d; }
+    td { padding: 8px 12px; border-bottom: 1px solid #21262d; vertical-align:middle; }
+    .badge { background: #9e6a03; color: #e6edf3; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; }
+    .refresh { color: #484f58; font-size: 0.8em; text-align: right; margin-top: 1em; }
+    .back { display:inline-block; margin-bottom:1em; color:#8b949e; font-size:0.9em; }
+    .book-card { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:1em 1.5em; margin-bottom:1em; }
+    .book-card h2 { margin:0 0 0.3em; font-size:1.2em; }
+    .book-card .subtitle { color:#8b949e; font-size:0.85em; margin-bottom:0.8em; }
+    .pill { display:inline-block; background:#21262d; border-radius:12px; padding:2px 10px; font-size:0.8em; color:#8b949e; margin-right:6px; }
+    .pill-green { background:#0d1f17; color:#3fb950; }
+    .pill-yellow { background:#272115; color:#d29922; }
+"""
 
 
 def _fmt_duration(secs: float | None) -> str:
-    if secs is None:
+    if not secs:
         return "—"
     m, s = divmod(int(secs), 60)
     h, m = divmod(m, 60)
     if h:
         return f"{h}h{m:02d}m{s:02d}s"
     return f"{m}m{s:02d}s"
+
+
+def _fmt_hours(secs: int) -> str:
+    h, r = divmod(secs, 3600)
+    m = r // 60
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m"
 
 
 def _estimate_duration(chars: int, text: str) -> str:
@@ -73,11 +112,6 @@ def _seg_status(seg: dict) -> str:
 
 
 def _compute_eta(segs: list) -> str:
-    """
-    Estimate remaining generation time based on completed segments.
-    Uses: avg real_seconds_per_char from segments with generated_at timestamps.
-    """
-    # Collect (chars, real_elapsed) for completed segments
     timed = []
     prev_time = None
     for seg in segs:
@@ -119,7 +153,6 @@ def _compute_eta(segs: list) -> str:
 
 
 def _read_chunk_progress(seg_mp3_path: Path) -> tuple[int, int] | None:
-    """Read per-chunk progress from ._progress.json if it exists."""
     prog_file = seg_mp3_path.with_suffix("._progress.json")
     try:
         data = json.loads(prog_file.read_text())
@@ -128,8 +161,70 @@ def _read_chunk_progress(seg_mp3_path: Path) -> tuple[int, int] | None:
         return None
 
 
-def render_html(plan: dict, audio_dir: Path | None = None) -> str:
+def render_index_html(library: Library) -> str:
+    """Render the library index page listing all books."""
+    books = library.list_books()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cards = []
+    for b in books:
+        book_id = b["book_id"]
+        title = b.get("title", book_id)
+        total = b.get("total_segments", 0)
+        generated = b.get("generated_segments", 0)
+        done = b.get("done_segments", 0)
+        dur = _fmt_hours(b.get("total_audio_sec", 0))
+        gen_pct = int(generated / total * 100) if total else 0
+        upload_inner_pct = int(done / generated * 100) if generated else 0
+        playlist = b.get("youtube_playlist", "")
+        yt_link = (f'<a href="https://www.youtube.com/playlist?list={playlist}" target="_blank">▶ 播放列表</a>'
+                   if playlist else "—")
+
+        status_pill = ""
+        if generated == total and total > 0:
+            status_pill = '<span class="pill pill-green">✅ 全部完成</span>'
+        elif generated > 0:
+            status_pill = f'<span class="pill pill-yellow">🔄 生成中 {generated}/{total}</span>'
+        else:
+            status_pill = f'<span class="pill">⏳ 待开始</span>'
+
+        cards.append(f"""
+  <div class="book-card">
+    <h2><a href="/book/{book_id}">《{title}》</a></h2>
+    <div class="subtitle">ID: <code>{book_id}</code> &nbsp;·&nbsp; {yt_link}</div>
+    <div style="margin-bottom:0.6em">
+      {status_pill}
+      <span class="pill">🎵 {dur}</span>
+      <span class="pill">上传 {done}/{total}</span>
+    </div>
+    <div style="background:#21262d;border-radius:6px;height:10px;overflow:hidden">
+      <div style="width:{gen_pct}%;background:#238636;height:100%;border-radius:6px;position:relative">
+        <div style="width:{upload_inner_pct}%;background:#155724;height:100%;border-radius:6px 0 0 6px;position:absolute;top:0;left:0"></div>
+      </div>
+    </div>
+  </div>""")
+
+    return f"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="refresh" content="60">
+  <title>有声书书库</title>
+  <style>{DARK_CSS}</style>
+</head>
+<body>
+  <h1>📚 有声书书库</h1>
+  <div class="meta">{len(books)} 本书 &nbsp;·&nbsp; 每60秒自动刷新</div>
+  {"".join(cards) if cards else "<p style='color:#8b949e'>书库为空，使用 audiobook_gen.py parse 添加书籍。</p>"}
+  <div class="refresh">最后更新：{now}</div>
+</body>
+</html>"""
+
+
+def render_book_html(plan: dict, audio_dir: Path | None = None) -> str:
+    """Render the per-book detail page."""
     segs = plan["segments"]
+    book_id = plan.get("book_id", "")
     book_title = plan.get("book_title", "未知")
     voice = plan.get("voice_prompt") or "unconditional"
     voice_ref = plan.get("voice_ref_audio") or "—"
@@ -140,9 +235,7 @@ def render_html(plan: dict, audio_dir: Path | None = None) -> str:
     done = len([s for s in segs if s.get("youtube_video_id")])
     generated = len([s for s in segs if s.get("generated_at")])
 
-    upload_pct = int(done / total * 100) if total else 0
     gen_pct = int(generated / total * 100) if total else 0
-    # upload as % of the generated portion (for inner dark bar)
     upload_inner_pct = int(done / generated * 100) if generated else 0
     eta = _compute_eta(segs)
 
@@ -160,15 +253,12 @@ def render_html(plan: dict, audio_dir: Path | None = None) -> str:
         yt_id = seg.get("youtube_video_id")
         yt_link = (f'<a href="https://youtu.be/{yt_id}" target="_blank">▶ 播放</a>'
                    if yt_id else "—")
-        split_ids = ", ".join(seg.get("epub_split_ids", [])[:2])
 
-        # Per-segment mini progress bar with chunk counts
         if seg.get("skip"):
-            seg_bar = '<span style="color:#999">—</span>'
+            seg_bar = '<span style="color:#484f58">—</span>'
         elif seg.get("generated_at"):
-            seg_bar = '<span style="color:#28a745;font-weight:bold">✓ 完成</span>'
+            seg_bar = '<span style="color:#3fb950;font-weight:bold">✓ 完成</span>'
         else:
-            # Try to read live chunk progress
             chunk_prog = None
             if audio_dir:
                 mp3 = audio_dir / f"seg{idx:04d}.mp3"
@@ -178,16 +268,15 @@ def render_html(plan: dict, audio_dir: Path | None = None) -> str:
                 pct = int(cdone / ctotal * 100) if ctotal else 0
                 seg_bar = (
                     f'<div style="display:flex;align-items:center;gap:6px;min-width:130px">'
-                    f'<div style="flex:1;background:#ddd;border-radius:4px;height:8px">'
-                    f'<div style="width:{pct}%;background:#007bff;height:100%;border-radius:4px"></div>'
+                    f'<div style="flex:1;background:#21262d;border-radius:4px;height:8px">'
+                    f'<div style="width:{pct}%;background:#58a6ff;height:100%;border-radius:4px"></div>'
                     f'</div>'
-                    f'<span style="font-size:0.8em;color:#555;white-space:nowrap">{cdone}/{ctotal}</span>'
+                    f'<span style="font-size:0.8em;color:#8b949e;white-space:nowrap">{cdone}/{ctotal}</span>'
                     f'</div>'
                 )
             else:
-                seg_bar = '<span style="color:#aaa;font-size:0.85em">等待中</span>'
+                seg_bar = '<span style="color:#484f58;font-size:0.85em">等待中</span>'
 
-        # ETA for this segment from generated_at
         gen_at = seg.get("generated_at")
         if gen_at:
             try:
@@ -219,31 +308,14 @@ def render_html(plan: dict, audio_dir: Path | None = None) -> str:
   <meta charset="UTF-8">
   <meta http-equiv="refresh" content="30">
   <title>《{book_title}》有声书进度</title>
-  <style>
-    body {{ font-family: -apple-system, sans-serif; max-width: 1200px; margin: 2em auto; padding: 0 1em; background: #0d1117; color: #e6edf3; }}
-    h1 {{ color: #e6edf3; }}
-    .meta {{ color: #8b949e; margin-bottom: 1.5em; }}
-    .progress-wrap {{ margin: 0.5em 0 1.5em; }}
-    .progress-label {{ font-size: 0.85em; color: #8b949e; margin-bottom: 3px; }}
-    .progress-bar {{ background: #21262d; border-radius: 8px; height: 16px; }}
-    .progress-fill-green {{ background: #238636; height: 100%; border-radius: 8px; transition: width 0.5s; }}
-    .stats {{ display: flex; gap: 2em; margin: 1em 0 1.5em; flex-wrap: wrap; }}
-    .stat {{ text-align: center; }}
-    .stat-num {{ font-size: 2em; font-weight: bold; color: #3fb950; }}
-    .stat-label {{ color: #8b949e; font-size: 0.9em; }}
-    .eta-box {{ display:inline-block; background:#272115; border:1px solid #9e6a03; border-radius:6px; padding:4px 12px; font-weight:bold; color:#d29922; margin-left:1em; }}
-    table {{ border-collapse: collapse; width: 100%; margin-top: 1em; }}
-    th {{ background: #161b22; color: #8b949e; padding: 8px 12px; text-align: left; border-bottom: 1px solid #30363d; }}
-    td {{ padding: 8px 12px; border-bottom: 1px solid #21262d; vertical-align:middle; }}
-    .badge {{ background: #9e6a03; color: #e6edf3; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; }}
-    a {{ color: #58a6ff; text-decoration: none; }}
-    .refresh {{ color: #484f58; font-size: 0.8em; text-align: right; margin-top: 1em; }}
-  </style>
+  <style>{DARK_CSS}</style>
 </head>
 <body>
+  <a class="back" href="/">← 书库</a>
   <h1>📖 《{book_title}》有声书</h1>
   <div class="meta">
-    声音：{voice} &nbsp;|&nbsp; 参考音频：{voice_ref} &nbsp;|&nbsp; 步数：{steps}
+    ID: <code>{book_id}</code> &nbsp;|&nbsp;
+    声音：{voice[:40] + "…" if len(voice) > 40 else voice} &nbsp;|&nbsp; 步数：{steps}
   </div>
 
   <div class="progress-wrap">
@@ -282,33 +354,74 @@ def render_html(plan: dict, audio_dir: Path | None = None) -> str:
 </html>"""
 
 
-def generate_static_html(segments_file: Path) -> Path:
-    """Generate a static HTML file alongside the segments JSON."""
-    plan = json.loads(segments_file.read_text())
-    html = render_html(plan)
-    out = segments_file.with_suffix("_dashboard.html")
-    out.write_text(html, encoding="utf-8")
-    return out
+def start_server(library_root: Path, port: int = 8765, single_book_id: str | None = None):
+    """Start a live-updating HTTP server.
 
-
-def start_server(segments_file: Path, port: int = 8765):
-    """Start a live-updating HTTP server for the dashboard."""
-    segments_file = Path(segments_file)
+    Routes:
+      /                  → library index (or redirect to single book if single_book_id set)
+      /book/<book_id>    → per-book detail page
+    """
+    library_root = Path(library_root)
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            plan = json.loads(segments_file.read_text())
-            html = render_html(plan, audio_dir=segments_file.parent / "audio").encode("utf-8")
+            path = urlparse(self.path).path.rstrip("/") or "/"
+
+            if path == "/":
+                if single_book_id:
+                    self._redirect(f"/book/{single_book_id}")
+                    return
+                lib = Library(library_root)
+                html = render_index_html(lib).encode("utf-8")
+
+            elif path.startswith("/book/"):
+                book_id = path[len("/book/"):]
+                seg_file = library_root / book_id / "segments.json"
+                if not seg_file.exists():
+                    self._404(f"Book not found: {book_id}")
+                    return
+                plan = json.loads(seg_file.read_text(encoding="utf-8"))
+                audio_dir = seg_file.parent / "audio"
+                html = render_book_html(plan, audio_dir=audio_dir).encode("utf-8")
+
+            else:
+                self._404(f"Unknown path: {path}")
+                return
+
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(html)))
             self.end_headers()
             self.wfile.write(html)
 
+        def _redirect(self, location: str):
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.end_headers()
+
+        def _404(self, msg: str):
+            body = f"<h1>404</h1><p>{msg}</p>".encode()
+            self.send_response(404)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def log_message(self, fmt, *args):
             pass  # suppress access logs
 
     server = http.server.HTTPServer(("", port), Handler)
     print(f"Dashboard: http://localhost:{port}")
-    print("Share publicly: ssh -R 80:localhost:{port} nokey@localhost.run")
+    if single_book_id:
+        print(f"  → Redirects to /book/{single_book_id}")
+    print("Share publicly: cloudflared tunnel --url localhost:{port}")
     server.serve_forever()
+
+
+def generate_static_html(segments_file: Path) -> Path:
+    """Generate a static HTML file alongside the segments JSON."""
+    plan = json.loads(segments_file.read_text(encoding="utf-8"))
+    html = render_book_html(plan)
+    out = segments_file.with_suffix("_dashboard.html")
+    out.write_text(html, encoding="utf-8")
+    return out
