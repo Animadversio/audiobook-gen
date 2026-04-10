@@ -326,6 +326,28 @@ PYTHONIOENCODING=utf-8 \
 `PYTHONIOENCODING=utf-8` — prevents emoji crash on WSL stdout.
 `TORCHDYNAMO_DISABLE=1` — set automatically inside generator/voxcpm.py; no need to pass externally.
 
+## Dashboard
+
+The dashboard (`audiobook_gen.py dashboard BOOK_ID`) serves a live HTML page on port 8765.
+
+Features:
+- **Dark theme** (GitHub Dark palette — `#0d1117` background)
+- **Single combined progress bar** — green fill shows generation progress, darker overlay shows upload progress; ETA and percentage shown inline
+- **Per-chapter chunk bar** — shows `done/total` chunks for in-progress chapters (reads `audio/seg*._progress.json`)
+- **Completion time** — shows HH:MM timestamp for each finished chapter
+- **YouTube link** — clickable link for each uploaded chapter
+- **Auto-refresh** every 30 seconds
+
+To expose externally use cloudflared:
+```bash
+cloudflared tunnel --url localhost:8765
+```
+URL is written to `/tmp/audiobook_tunnel_url.txt` by `start_services.sh`.
+
+### epub title extraction
+
+`parse` now reads the book title from epub DC metadata (`parsers/epub.py::get_epub_title`), trimming any marketing suffix after `(`. This ensures the dashboard title and YouTube video titles use the real book name rather than the hashed epub filename.
+
 ## Credits
 
 - TTS: [VoxCPM2](https://github.com/OpenBMB/VoxCPM) by OpenBMB
