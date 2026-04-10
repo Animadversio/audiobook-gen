@@ -9,9 +9,19 @@ Features:
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+
+# Resolve ffmpeg — not on system PATH in conda envs on WSL
+_FFMPEG = shutil.which("ffmpeg") or next(
+    (p for p in [
+        "/home/binxu/miniforge3/envs/research/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+    ] if Path(p).exists()), "ffmpeg"
+)
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -44,7 +54,7 @@ def _mp3_to_mp4(mp3_path: Path) -> Path:
     """Wrap MP3 in a silent black-background MP4 for YouTube upload."""
     mp4_path = mp3_path.with_suffix(".mp4")
     subprocess.run([
-        "ffmpeg", "-y",
+        _FFMPEG, "-y",
         "-f", "lavfi", "-i", "color=c=black:s=1280x720:r=1",
         "-i", str(mp3_path),
         "-shortest",

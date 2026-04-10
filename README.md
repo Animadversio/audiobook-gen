@@ -231,6 +231,8 @@ ffmpeg -y -i seg{N}._tmp.wav -codec:a libmp3lame -b:a 64k seg{N}.mp3
 ```
 Then write `seg{N}.json` manually (copy from `segments.json`, add `generated_at` and `audio_duration_sec`). Re-running `generate` will skip the recovered segment via hash check.
 
+**Note:** The same ffmpeg PATH issue affects the YouTube uploader (`uploaders/youtube.py`), which uses ffmpeg to wrap MP3 in a black-background MP4 before upload. Fixed by resolving ffmpeg at module import time via `shutil.which()` with conda env fallback paths.
+
 ---
 
 ### UnicodeEncodeError on emoji (❌ ✅)
