@@ -29,8 +29,15 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-DEFAULT_TOKEN_PATH = Path.home() / ".config/nanoclaw/youtube_token.json"
-DEFAULT_SECRET_PATH = Path.home() / ".config/nanoclaw/youtube_client_secret.json"
+def _real_config_dir() -> Path:
+    # Path.home() uses $HOME which may be a session-scoped dir in container envs.
+    # Use pwd to get the real home directory regardless of $HOME.
+    import pwd, os
+    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    return real_home / ".config"
+
+DEFAULT_TOKEN_PATH = _real_config_dir() / "nanoclaw/youtube_token.json"
+DEFAULT_SECRET_PATH = _real_config_dir() / "nanoclaw/youtube_client_secret.json"
 
 HASH_MARKER = "文本哈希："  # marker used to find hash in description
 
