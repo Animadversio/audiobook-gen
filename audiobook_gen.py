@@ -59,7 +59,28 @@ def load_plan(paths) -> dict:
 
 
 def save_plan(paths, plan: dict):
-    # Atomic write: write to temp file then rename to avoid corruption on crash
+    # Atomic write: write to temp file then rename to avoid corruption on crash.
+    # Preserve youtube_video_id / youtube_uploaded_at written by the upload watcher
+    # (the generator doesn't own those fields but must not clobber them).
+    if paths.segments_file.exists():
+        try:
+            existing = json.loads(paths.segments_file.read_text(encoding='utf-8'))
+            yt_by_idx = {
+                s["seg_index"]: {
+                    "youtube_video_id": s.get("youtube_video_id"),
+                    "youtube_uploaded_at": s.get("youtube_uploaded_at"),
+                }
+                for s in existing.get("segments", [])
+                if s.get("youtube_video_id")
+            }
+            for seg in plan.get("segments", []):
+                idx = seg.get("seg_index")
+                if idx in yt_by_idx and not seg.get("youtube_video_id"):
+                    seg.update(yt_by_idx[idx])
+            if not plan.get("youtube_playlist_id") and existing.get("youtube_playlist_id"):
+                plan["youtube_playlist_id"] = existing["youtube_playlist_id"]
+        except Exception:
+            pass
     tmp = paths.segments_file.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding='utf-8')
     tmp.replace(paths.segments_file)
