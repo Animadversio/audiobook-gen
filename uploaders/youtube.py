@@ -9,6 +9,7 @@ Features:
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -48,6 +49,48 @@ def _load_credentials(token_path: Path = DEFAULT_TOKEN_PATH) -> Credentials:
         data["token"] = creds.token
         token_path.write_text(json.dumps(data), encoding='utf-8')
     return creds
+
+
+def _get_duration(path: Path) -> float:
+    r = subprocess.run([_FFMPEG, "-i", str(path)], capture_output=True, text=True)
+    m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", r.stderr)
+    return int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]) if m else 0.0
+
+
+def _trim_trailing_silence(
+    mp3_path: Path,
+    threshold_db: float = -40.0,
+    min_duration: float = 0.5,
+) -> Path:
+    """
+    Trim trailing silence from an MP3. Returns path to trimmed temp file.
+    If trimming saves < 0.1s, returns original path unchanged (no temp file).
+    """
+    import tempfile
+    tmp = Path(tempfile.mktemp(suffix=".mp3"))
+    silence_filter = (
+        f"areverse,"
+        f"silenceremove=start_periods=1:start_duration={min_duration}:start_threshold={threshold_db}dB,"
+        f"areverse"
+    )
+    result = subprocess.run(
+        [_FFMPEG, "-y", "-i", str(mp3_path),
+         "-af", silence_filter,
+         "-codec:a", "libmp3lame", "-b:a", "64k", str(tmp)],
+        capture_output=True,
+    )
+    if result.returncode != 0 or not tmp.exists():
+        return mp3_path  # fallback: use original
+
+    dur_before = _get_duration(mp3_path)
+    dur_after = _get_duration(tmp)
+    trimmed = dur_before - dur_after
+    if trimmed > 0.1:
+        print(f"  [TRIM] Removed {trimmed:.2f}s trailing silence ({dur_before:.1f}s → {dur_after:.1f}s)")
+        return tmp
+    else:
+        tmp.unlink(missing_ok=True)
+        return mp3_path
 
 
 def _mp3_to_mp4(mp3_path: Path) -> Path:
@@ -160,8 +203,11 @@ class YouTubeUploader:
 
         description = _build_description(seg_meta, book_title)
 
+        # Trim trailing silence before upload (saves to a temp file, non-destructive)
+        mp3_to_encode = _trim_trailing_silence(mp3_path)
+
         # Convert MP3 → MP4
-        mp4_path = _mp3_to_mp4(mp3_path)
+        mp4_path = _mp3_to_mp4(mp3_to_encode)
         try:
             media = MediaFileUpload(str(mp4_path), mimetype="video/mp4", resumable=True)
             body = {
@@ -188,3 +234,5 @@ class YouTubeUploader:
             return {"video_id": video_id, "skipped": False}
         finally:
             mp4_path.unlink(missing_ok=True)
+            if mp3_to_encode != mp3_path:
+                mp3_to_encode.unlink(missing_ok=True)

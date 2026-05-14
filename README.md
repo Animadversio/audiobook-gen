@@ -13,7 +13,11 @@ Integrates with [NanoClaw](https://github.com/anthropics/nanoclaw) for natural-l
 - **Text-audio pairing** — every MP3 has a paired JSON with text hash for traceability
 - **Idempotent generation** — skips already-generated segments (hash check)
 - **YouTube upload** with deduplication (text hash in description)
-- **Read-only dashboard** — auto-refreshing HTML progress page
+- **Read-only dashboard** — auto-refreshing HTML progress page (dark theme, chunk-level ETA)
+- **Multi-book library** — dashboard shows all books at `/`, per-book view at `/book/<id>`
+- **Trailing silence trimming** — auto-trims silence before YouTube upload (non-destructive; original MP3 unchanged)
+- **`start_services.sh`** — one-shot script to start dashboard + cloudflared tunnel + watchdog
+- **DC title extraction** — epub `DC:title` metadata used for book title (trims marketing suffixes at `(` / `（`)
 
 ## Requirements
 
@@ -349,6 +353,31 @@ URL is written to `/tmp/audiobook_tunnel_url.txt` by `start_services.sh`.
 ### epub title extraction
 
 `parse` now reads the book title from epub DC metadata (`parsers/epub.py::get_epub_title`), trimming any marketing suffix after `(`. This ensures the dashboard title and YouTube video titles use the real book name rather than the hashed epub filename.
+
+## Post-processing: trailing silence trimming
+
+Before each YouTube upload, the uploader automatically trims trailing silence from the MP3 (strategy: `areverse → silenceremove → areverse`). The original MP3 on disk is **never modified** — a temp file is used and deleted after upload.
+
+Parameters: threshold `-40dB`, minimum silence duration `0.5s`. If trimming saves less than 0.1s the original file is used unchanged.
+
+You can also run trimming manually via `postprocess.py`:
+
+```bash
+python postprocess.py audio/seg0003.mp3 --out seg0003_trimmed.mp3
+# Reports: Before: 932.16s → After: 929.07s (removed 3.09s)
+```
+
+## Service management: `start_services.sh`
+
+Starts dashboard + cloudflared tunnel + watchdog in one command:
+
+```bash
+cd /path/to/audiobook-gen
+GEN_PID=$(pgrep -f "audiobook_gen.py generate" | head -1)
+./start_services.sh BOOK_ID $GEN_PID
+```
+
+The current tunnel URL is written to `/tmp/audiobook_tunnel_url.txt`. Retrieve it any time with `cat /tmp/audiobook_tunnel_url.txt`.
 
 ## Credits
 
